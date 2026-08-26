@@ -9,7 +9,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 
-from sample_effeciency import HORIZON, N_CANDIDATES, choose_action, cost, predict
+from sample_effeciency import (
+    HORIZON, N_CANDIDATES, choose_action_random_shooting, cost, predict,
+)
 
 
 def choose_action_reference(model, state, acts_all):
@@ -41,7 +43,7 @@ def main():
         acts = rng.uniform(-2, 2, size=(N_CANDIDATES, HORIZON, 1)).astype(np.float32)
 
         ref_action, ref_cost = choose_action_reference(model, state, acts)
-        fast_action = choose_action(model, state, acts=acts)
+        fast_action = choose_action_random_shooting(model, state, acts=acts)
 
         same = np.allclose(ref_action, fast_action, atol=1e-5)
         mismatches += (not same)

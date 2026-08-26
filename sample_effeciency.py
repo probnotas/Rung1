@@ -1,3 +1,4 @@
+import json
 import time
 
 import gymnasium as gym
@@ -13,8 +14,15 @@ N_SEEDS = 3                 # independently trained models per sample size
 N_EVAL = 15                 # control rollouts per trained model
 EVAL_STEPS = 200            # env steps per rollout
 HORIZON = 20                # MPC planning horizon
-N_CANDIDATES = 300          # MPC random-shooting candidates
+N_CANDIDATES = 300          # random-shooting candidates (baseline planner)
+ACTION_LOW, ACTION_HIGH = -2.0, 2.0
 MASTER_SEED = 0
+
+# CEM planner
+CEM_ITERS = 5               # refinement iterations per control step
+CEM_CANDIDATES = 100        # sequences sampled per iteration
+CEM_ELITES = 10             # lowest-cost sequences the distribution is refit to
+CEM_INIT_STD = 1.0
 
 # Prediction-accuracy experiment: a held-out test set that is never trained on.
 # The pool is TEST_SIZE larger than POOL_SIZE so that the biggest sample size
@@ -71,18 +79,13 @@ def cost(state):
 
 _TARGET_T = torch.tensor([1.0, 0.0, 0.0])
 
-def choose_action(model, state, acts=None):
-    """Random-shooting MPC.
+def rollout_costs(model, state, acts):
+    """Total cost over the horizon for each candidate action sequence.
 
-    Identical in behaviour to the original per-candidate Python loop: sample
-    N_CANDIDATES action sequences of length HORIZON, roll each one forward
-    through the learned model, sum cost(state) over the horizon, and return the
-    first action of the lowest-cost sequence. The candidates are simply rolled
-    out as one batch instead of one at a time, which is ~120x faster and makes
-    the averaged experiment feasible. See test_planner_equivalence.py.
+    acts: (n_candidates, HORIZON, 1). Returns (n_candidates,) summed cost.
+    All candidates are rolled out as one batch, which is what makes the
+    averaged experiments feasible. Shared by both planners below.
     """
-    if acts is None:
-        acts = np.random.uniform(-2, 2, size=(N_CANDIDATES, HORIZON, 1)).astype(np.float32)
     n_cand = acts.shape[0]
     sim = torch.from_numpy(np.tile(np.asarray(state, dtype=np.float32), (n_cand, 1)))
     acts_t = torch.from_numpy(np.ascontiguousarray(acts, dtype=np.float32))
@@ -91,7 +94,49 @@ def choose_action(model, state, acts=None):
         for h in range(HORIZON):
             sim = model(torch.cat([sim, acts_t[:, h, :]], dim=1))
             total += ((sim - _TARGET_T) ** 2).sum(dim=1)
-    return acts[int(torch.argmin(total)), 0]
+    return total.numpy()
+
+
+def choose_action_random_shooting(model, state, acts=None):
+    """The original random-shooting planner, kept as a baseline for comparison.
+
+    Samples N_CANDIDATES uniform action sequences, rolls each through the model,
+    and returns the first action of the lowest-cost one. Behaviourally identical
+    to the pre-vectorisation Python loop (see test_planner_equivalence.py).
+    """
+    if acts is None:
+        acts = np.random.uniform(
+            ACTION_LOW, ACTION_HIGH, size=(N_CANDIDATES, HORIZON, 1)
+        ).astype(np.float32)
+    costs = rollout_costs(model, state, acts)
+    return acts[int(np.argmin(costs)), 0]
+
+
+def choose_action(model, state):
+    """Cross-Entropy Method MPC (receding horizon).
+
+    Maintains a Gaussian over HORIZON-step action sequences, initialised at
+    mean=0, std=CEM_INIT_STD. Each of CEM_ITERS iterations samples
+    CEM_CANDIDATES sequences (clipped to the action bounds), scores them
+    through the learned model, keeps the CEM_ELITES lowest-cost ones, and
+    refits the Gaussian to those elites. Returns the first action of the
+    final mean sequence.
+
+    Unlike random shooting, the search concentrates around promising regions
+    across iterations, so a more accurate model can actually be exploited.
+    """
+    mean = np.zeros((HORIZON, 1), dtype=np.float32)
+    std = np.full((HORIZON, 1), CEM_INIT_STD, dtype=np.float32)
+
+    for _ in range(CEM_ITERS):
+        noise = np.random.randn(CEM_CANDIDATES, HORIZON, 1).astype(np.float32)
+        acts = np.clip(mean + std * noise, ACTION_LOW, ACTION_HIGH).astype(np.float32)
+        costs = rollout_costs(model, state, acts)
+        elites = acts[np.argsort(costs)[:CEM_ELITES]]
+        mean = elites.mean(axis=0)
+        std = elites.std(axis=0)
+
+    return np.clip(mean[0], ACTION_LOW, ACTION_HIGH).astype(np.float32)
 
 # ---------- 4. TEST how well a trained model controls the pendulum ----------
 def evaluate(model, steps=None, n_eval=None, eval_seeds=None):
@@ -207,8 +252,9 @@ def run_prediction_experiment():
 
 
 # ---------- 6. RUN the control experiment ----------
-def main():
+def main(planner_name="cem"):
     t_start = time.time()
+    print(f"Control experiment using planner: {planner_name}")
     rng = np.random.default_rng(MASTER_SEED)
 
     print(f"Collecting data pool ({POOL_SIZE} samples)...")
@@ -278,6 +324,24 @@ def main():
             f"  {SAMPLE_SIZES[a]:>5} vs {SAMPLE_SIZES[b]:>5}: "
             f"{means[a]:.3f} vs {means[b]:.3f}  -> {verdict}"
         )
+
+    # Persist so runs with different planners stay comparable.
+    with open(f"results_{planner_name}.json", "w") as f:
+        json.dump(
+            {
+                "planner": planner_name,
+                "sample_sizes": SAMPLE_SIZES,
+                "means": means,
+                "stds": stds,
+                "sems": sems,
+                "n_seeds": N_SEEDS,
+                "n_eval": N_EVAL,
+                "master_seed": MASTER_SEED,
+            },
+            f,
+            indent=2,
+        )
+    print(f"Saved results to results_{planner_name}.json")
 
     print(f"\nTotal runtime: {(time.time() - t_start) / 60:.1f} min")
 
