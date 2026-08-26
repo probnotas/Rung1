@@ -183,8 +183,10 @@ def run_prediction_experiment():
     plt.xlabel("Number of training samples")
     plt.ylabel("One-step prediction MSE on held-out set (lower = better)")
     plt.title("Model quality: prediction error vs. training data")
-    if max(means) / max(min(means), 1e-12) > 20:
-        plt.yscale("log")
+    # Log on both axes: MSE spans ~8x (the low-data rise flattens everything
+    # else on a linear scale) and the sample sizes are log-spaced.
+    plt.yscale("log")
+    plt.xscale("log")
     plt.gca().invert_xaxis()
     plt.grid(True, which="both")
     plt.tight_layout()
