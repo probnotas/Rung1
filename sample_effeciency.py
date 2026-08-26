@@ -1,4 +1,5 @@
 import json
+import math
 import time
 
 import gymnasium as gym
@@ -251,7 +252,73 @@ def run_prediction_experiment():
     return means, stds
 
 
-# ---------- 6. RUN the control experiment ----------
+# ---------- 6. REPORTING ----------
+def plot_control_results(sizes, means, stds, planner_name="cem",
+                         path="sample_efficiency.png"):
+    plt.figure(figsize=(7, 5))
+    plt.errorbar(sizes, means, yerr=stds, marker="o", capsize=4)
+    plt.xlabel("Number of training samples")
+    plt.ylabel("Average control cost (lower = better)")
+    plt.title(f"Sample efficiency: control quality vs. training data ({planner_name.upper()})")
+    # Log x: the sizes are log-spaced, so a linear axis crowds 50-500 together.
+    plt.xscale("log")
+    plt.gca().invert_xaxis()
+    plt.grid(True, which="both")
+    plt.tight_layout()
+    plt.savefig(path, dpi=150)
+    print(f"Saved graph to {path}")
+
+
+def report_control_results(sizes, means, stds, sems):
+    """Table, all-pairs significance, and a weighted trend test.
+
+    Adjacent-pair comparison alone is misleading here: a gradual degradation
+    can leave every neighbouring step inside the noise while distant sizes
+    separate cleanly, so all pairs are checked.
+    """
+    print(f"\nResults  ({N_SEEDS} models x {N_EVAL} rollouts = "
+          f"{N_SEEDS * N_EVAL} runs per sample size)")
+    print(f"{'samples':>8} {'mean':>9} {'std':>9} {'sem':>8}   {'95% CI':>18}")
+    print("-" * 58)
+    for n, m, sd, se in zip(sizes, means, stds, sems):
+        print(f"{n:>8} {m:>9.3f} {sd:>9.3f} {se:>8.3f}   "
+              f"[{m - 1.96 * se:>7.3f}, {m + 1.96 * se:>7.3f}]")
+    print("-" * 58)
+
+    print("\nAll pairwise comparisons (non-overlapping 95% CI = real):")
+    n_pairs, n_real = 0, 0
+    for i in range(len(sizes)):
+        for j in range(i + 1, len(sizes)):
+            n_pairs += 1
+            lo_a, hi_a = means[i] - 1.96 * sems[i], means[i] + 1.96 * sems[i]
+            lo_b, hi_b = means[j] - 1.96 * sems[j], means[j] + 1.96 * sems[j]
+            if hi_a < lo_b or hi_b < lo_a:
+                n_real += 1
+                print(f"  REAL: {sizes[i]:>5} ({means[i]:.3f}) vs "
+                      f"{sizes[j]:>5} ({means[j]:.3f})")
+    if n_real == 0:
+        print("  (none — every pair overlaps)")
+    print(f"  -> {n_real} of {n_pairs} pairs separate")
+
+    # Weighted least squares of cost on log10(samples); slope < 0 means more
+    # data really does buy better control.
+    x = np.log10(np.asarray(sizes, dtype=float))
+    y = np.asarray(means, dtype=float)
+    w = 1.0 / np.asarray(sems, dtype=float) ** 2
+    X = np.vstack([np.ones_like(x), x]).T
+    XtW = X.T * w
+    beta = np.linalg.solve(XtW @ X, XtW @ y)
+    slope_se = np.sqrt(np.linalg.inv(XtW @ X)[1, 1])
+    z = beta[1] / slope_se
+    p = math.erfc(abs(z) / math.sqrt(2.0))
+    print(f"\nTrend: cost changes {beta[1]:+.3f} +/- {slope_se:.3f} per 10x more "
+          f"data (z={z:.2f}, p={p:.4f})")
+    print("  " + ("significant downward trend: more data -> better control"
+                  if beta[1] < 0 and p < 0.05 else
+                  "no significant trend"))
+
+
+# ---------- 7. RUN the control experiment ----------
 def main(planner_name="cem"):
     t_start = time.time()
     print(f"Control experiment using planner: {planner_name}")
@@ -288,42 +355,10 @@ def main(planner_name="cem"):
         print(f"{n:>5} samples -> avg control cost = {combined_mean:.3f} +/- {combined_std:.3f}\n")
 
     # ---------- 6. PLOT the result ----------
-    plt.figure(figsize=(7, 5))
-    plt.errorbar(SAMPLE_SIZES, means, yerr=stds, marker="o", capsize=4)
-    plt.xlabel("Number of training samples")
-    plt.ylabel("Average control cost (lower = better)")
-    plt.title("Sample efficiency: control quality vs. training data")
-    plt.gca().invert_xaxis()
-    plt.grid(True)
-    plt.savefig("sample_efficiency.png", dpi=150)
-    print("Saved graph to sample_efficiency.png")
+    plot_control_results(SAMPLE_SIZES, means, stds, planner_name)
 
     # ---------- 7. RESULTS TABLE ----------
-    total_runs = N_SEEDS * N_EVAL
-    print(
-        f"\nResults  ({N_SEEDS} models x {N_EVAL} rollouts = {total_runs} runs per sample size)"
-    )
-    print(f"{'samples':>8} {'mean':>9} {'std':>9} {'sem':>8}   {'95% CI':>18}")
-    print("-" * 58)
-    for n, m, sd, se in zip(SAMPLE_SIZES, means, stds, sems):
-        lo, hi = m - 1.96 * se, m + 1.96 * se
-        print(f"{n:>8} {m:>9.3f} {sd:>9.3f} {se:>8.3f}   [{lo:>7.3f}, {hi:>7.3f}]")
-    print("-" * 58)
-    print("Error bars on the plot are std. Use the 95% CI column to judge")
-    print("significance: overlapping intervals mean the difference is noise.")
-
-    # Which neighbouring sample sizes actually separate?
-    print("\nPairwise check (adjacent sizes, non-overlapping 95% CI = real):")
-    for i in range(len(SAMPLE_SIZES) - 1):
-        a, b = i, i + 1
-        lo_a, hi_a = means[a] - 1.96 * sems[a], means[a] + 1.96 * sems[a]
-        lo_b, hi_b = means[b] - 1.96 * sems[b], means[b] + 1.96 * sems[b]
-        real = hi_a < lo_b or hi_b < lo_a
-        verdict = "REAL " if real else "noise"
-        print(
-            f"  {SAMPLE_SIZES[a]:>5} vs {SAMPLE_SIZES[b]:>5}: "
-            f"{means[a]:.3f} vs {means[b]:.3f}  -> {verdict}"
-        )
+    report_control_results(SAMPLE_SIZES, means, stds, sems)
 
     # Persist so runs with different planners stay comparable.
     with open(f"results_{planner_name}.json", "w") as f:
@@ -356,7 +391,16 @@ if __name__ == "__main__":
         default="both",
         help="control = MPC control cost; prediction = held-out one-step MSE",
     )
+    parser.add_argument("--replot", action="store_true",
+                        help="redraw plot/table from a saved results JSON")
+    parser.add_argument("--planner", default="cem", help="label for --replot")
     args = parser.parse_args()
+
+    if args.replot:
+        d = json.load(open(f"results_{args.planner}.json"))
+        plot_control_results(d["sample_sizes"], d["means"], d["stds"], d["planner"])
+        report_control_results(d["sample_sizes"], d["means"], d["stds"], d["sems"])
+        raise SystemExit(0)
 
     if args.experiment in ("prediction", "both"):
         run_prediction_experiment()
