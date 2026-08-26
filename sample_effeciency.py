@@ -16,6 +16,12 @@ HORIZON = 20                # MPC planning horizon
 N_CANDIDATES = 300          # MPC random-shooting candidates
 MASTER_SEED = 0
 
+# Prediction-accuracy experiment: a held-out test set that is never trained on.
+# The pool is TEST_SIZE larger than POOL_SIZE so that the biggest sample size
+# (5000) can still be drawn entirely from outside the 1000-sample test set.
+TEST_SIZE = 1000
+PRED_POOL_SIZE = POOL_SIZE + TEST_SIZE
+
 torch.set_num_threads(2)
 
 # ---------- 1. COLLECT one big pool of data ----------
@@ -121,7 +127,84 @@ def evaluate(model, steps=None, n_eval=None, eval_seeds=None):
     run_costs = np.array(run_costs)
     return run_costs.mean(), run_costs.std(), run_costs
 
-# ---------- 5. RUN the experiment ----------
+# ---------- 5. PREDICTION ACCURACY (no MPC in the loop) ----------
+def prediction_mse(model, X_test, Y_test):
+    """One-step prediction MSE on a held-out set."""
+    with torch.no_grad():
+        return float(((model(X_test) - Y_test) ** 2).mean())
+
+
+def run_prediction_experiment():
+    """Measure forward-model quality directly, isolating it from the controller.
+
+    Holds out a fixed TEST_SIZE test set that no model ever trains on, then
+    trains fresh models on each sample size and scores one-step MSE on it.
+    """
+    t_start = time.time()
+    rng = np.random.default_rng(MASTER_SEED)
+
+    print(f"Collecting data pool ({PRED_POOL_SIZE} samples: "
+          f"{POOL_SIZE} train pool + {TEST_SIZE} held-out test)...")
+    S, A, S2 = collect_data(PRED_POOL_SIZE)
+
+    # Fixed disjoint split: test indices are never available for training.
+    perm = rng.permutation(PRED_POOL_SIZE)
+    test_idx, train_pool_idx = perm[:TEST_SIZE], perm[TEST_SIZE:]
+    assert not set(test_idx) & set(train_pool_idx), "test set leaked into train pool"
+    assert len(train_pool_idx) >= max(SAMPLE_SIZES), (
+        f"train pool has {len(train_pool_idx)} samples but the sweep needs "
+        f"{max(SAMPLE_SIZES)}; increase PRED_POOL_SIZE"
+    )
+
+    X_test = torch.tensor(
+        np.concatenate([S[test_idx], A[test_idx]], axis=1), dtype=torch.float32
+    )
+    Y_test = torch.tensor(S2[test_idx], dtype=torch.float32)
+
+    # Reference point: how much error remains if you just predict "no change".
+    identity_mse = float(((torch.tensor(S[test_idx], dtype=torch.float32) - Y_test) ** 2).mean())
+
+    means, stds = [], []
+    for n in SAMPLE_SIZES:
+        seed_mses = []
+        for s in range(N_SEEDS):
+            idx = rng.choice(train_pool_idx, size=n, replace=False)
+            model = train_model(S[idx], A[idx], S2[idx], seed=MASTER_SEED + 1000 * s + n)
+            mse = prediction_mse(model, X_test, Y_test)
+            seed_mses.append(mse)
+            print(f"   n={n:>5}  seed {s + 1}/{N_SEEDS}  ->  test MSE = {mse:.6f}")
+        means.append(float(np.mean(seed_mses)))
+        stds.append(float(np.std(seed_mses, ddof=1)))
+        print(f"{n:>5} samples -> test MSE = {means[-1]:.6f} +/- {stds[-1]:.6f}\n")
+
+    # ---------- PLOT ----------
+    plt.figure(figsize=(7, 5))
+    plt.errorbar(SAMPLE_SIZES, means, yerr=stds, marker="o", capsize=4)
+    plt.xlabel("Number of training samples")
+    plt.ylabel("One-step prediction MSE on held-out set (lower = better)")
+    plt.title("Model quality: prediction error vs. training data")
+    if max(means) / max(min(means), 1e-12) > 20:
+        plt.yscale("log")
+    plt.gca().invert_xaxis()
+    plt.grid(True, which="both")
+    plt.tight_layout()
+    plt.savefig("prediction_mse.png", dpi=150)
+    print("Saved graph to prediction_mse.png")
+
+    # ---------- TABLE ----------
+    print(f"\nHeld-out test set: {TEST_SIZE} samples, never trained on")
+    print(f"Identity baseline (predict next_state = state): MSE = {identity_mse:.6f}\n")
+    print(f"{'samples':>8} {'test MSE':>12} {'std':>12}   {'vs identity':>12}")
+    print("-" * 52)
+    for n, m, sd in zip(SAMPLE_SIZES, means, stds):
+        print(f"{n:>8} {m:>12.6f} {sd:>12.6f}   {identity_mse / m:>11.1f}x")
+    print("-" * 52)
+    print(f"Best/worst MSE ratio across sample sizes: {max(means) / min(means):.1f}x")
+    print(f"\nPrediction experiment runtime: {(time.time() - t_start) / 60:.1f} min")
+    return means, stds
+
+
+# ---------- 6. RUN the control experiment ----------
 def main():
     t_start = time.time()
     rng = np.random.default_rng(MASTER_SEED)
@@ -198,4 +281,18 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--experiment",
+        choices=["control", "prediction", "both"],
+        default="both",
+        help="control = MPC control cost; prediction = held-out one-step MSE",
+    )
+    args = parser.parse_args()
+
+    if args.experiment in ("prediction", "both"):
+        run_prediction_experiment()
+    if args.experiment in ("control", "both"):
+        main()
