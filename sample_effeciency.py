@@ -140,13 +140,28 @@ def choose_action(model, state):
     return np.clip(mean[0], ACTION_LOW, ACTION_HIGH).astype(np.float32)
 
 # ---------- 4. TEST how well a trained model controls the pendulum ----------
-def evaluate(model, steps=None, n_eval=None, eval_seeds=None):
+def get_eval_seeds(n_eval=None, master_seed=MASTER_SEED):
+    """The fixed set of evaluation start-state seeds.
+
+    Shared by every experiment (model-based and the SAC baseline) so all of
+    them are scored on an identical set of start states.
+    """
+    n_eval = N_EVAL if n_eval is None else n_eval
+    return np.random.default_rng(master_seed).integers(0, 2**31 - 1, size=n_eval)
+
+
+def evaluate(model, steps=None, n_eval=None, eval_seeds=None, action_fn=None):
     """Run the control test n_eval times and return (mean, std, per_run_costs).
 
     Each run starts from a fresh env.reset(). Passing the same eval_seeds to
     every model means all conditions face an identical set of start states,
     which removes start-state variance from between-condition comparisons.
+
+    action_fn(model, state) -> action selects the action; it defaults to the
+    CEM planner. Passing a different policy (e.g. a trained SAC agent) reuses
+    this exact evaluation loop, so baselines are scored identically.
     """
+    action_fn = choose_action if action_fn is None else action_fn
     # Read config at call time, and let eval_seeds decide the count when given,
     # so the seed array and the loop can never disagree.
     steps = EVAL_STEPS if steps is None else steps
@@ -163,7 +178,7 @@ def evaluate(model, steps=None, n_eval=None, eval_seeds=None):
             state, _ = env.reset()
         total_cost = 0.0
         for _ in range(steps):
-            action = choose_action(model, state)
+            action = action_fn(model, state)
             state, _, term, trunc, _ = env.step(action)
             total_cost += cost(state)
             if term or trunc:
@@ -301,7 +316,11 @@ def report_control_results(sizes, means, stds, sems):
     print(f"  -> {n_real} of {n_pairs} pairs separate")
 
     # Weighted least squares of cost on log10(samples); slope < 0 means more
-    # data really does buy better control.
+    # data really does buy better control. Needs >=3 points to be meaningful
+    # (2 points fit exactly, 1 is singular).
+    if len(sizes) < 3:
+        print("\nTrend: need at least 3 sample sizes to fit a trend; skipped.")
+        return
     x = np.log10(np.asarray(sizes, dtype=float))
     y = np.asarray(means, dtype=float)
     w = 1.0 / np.asarray(sems, dtype=float) ** 2
@@ -328,7 +347,11 @@ def main(planner_name="cem"):
     S, A, S2 = collect_data(POOL_SIZE)
 
     # Common start states shared by every model, for variance reduction.
+    # Drawn from this run's rng (not get_eval_seeds()) so the rng stream — and
+    # therefore every training subset drawn below — stays byte-identical to
+    # previously recorded runs. The assert pins the two to the same values.
     eval_seeds = rng.integers(0, 2**31 - 1, size=N_EVAL)
+    assert np.array_equal(eval_seeds, get_eval_seeds()), "eval seed sources diverged"
 
     means, stds, sems, per_size_runs = [], [], [], []
 
