@@ -31,6 +31,13 @@ CEM_INIT_STD = 1.0
 TEST_SIZE = 1000
 PRED_POOL_SIZE = POOL_SIZE + TEST_SIZE
 
+# Forward-model parameterisation. True: the net predicts the *delta*
+# (next_state - state) and the predicted next state is state + output.
+# False: the net predicts next_state directly (the original formulation).
+# Prediction error is always reported in next-state space so the two are
+# directly comparable.
+PREDICT_DELTA = True
+
 torch.set_num_threads(2)
 
 # ---------- 1. COLLECT one big pool of data ----------
@@ -54,7 +61,8 @@ def train_model(states, actions, next_states, epochs=1000, seed=None):
     if seed is not None:
         torch.manual_seed(seed)
     X = torch.tensor(np.concatenate([states, actions], axis=1), dtype=torch.float32)
-    Y = torch.tensor(next_states, dtype=torch.float32)
+    targets = next_states - states if PREDICT_DELTA else next_states
+    Y = torch.tensor(targets, dtype=torch.float32)
     model = nn.Sequential(
         nn.Linear(4, 64), nn.ReLU(),
         nn.Linear(64, 64), nn.ReLU(),
@@ -72,7 +80,8 @@ def train_model(states, actions, next_states, epochs=1000, seed=None):
 def predict(model, state, action):
     x = torch.tensor(np.concatenate([state, action]), dtype=torch.float32)
     with torch.no_grad():
-        return model(x).numpy()
+        out = model(x).numpy()
+    return state + out if PREDICT_DELTA else out
 
 def cost(state):
     target = np.array([1.0, 0.0, 0.0])
@@ -93,7 +102,8 @@ def rollout_costs(model, state, acts):
     total = torch.zeros(n_cand)
     with torch.no_grad():
         for h in range(HORIZON):
-            sim = model(torch.cat([sim, acts_t[:, h, :]], dim=1))
+            out = model(torch.cat([sim, acts_t[:, h, :]], dim=1))
+            sim = sim + out if PREDICT_DELTA else out
             total += ((sim - _TARGET_T) ** 2).sum(dim=1)
     return total.numpy()
 
@@ -190,9 +200,16 @@ def evaluate(model, steps=None, n_eval=None, eval_seeds=None, action_fn=None):
 
 # ---------- 5. PREDICTION ACCURACY (no MPC in the loop) ----------
 def prediction_mse(model, X_test, Y_test):
-    """One-step prediction MSE on a held-out set."""
+    """One-step prediction MSE on a held-out set.
+
+    Y_test is always the true next state. When the net predicts deltas its
+    output is added back onto the input state first, so the error is measured
+    in next-state space in both modes and the numbers stay comparable.
+    """
     with torch.no_grad():
-        return float(((model(X_test) - Y_test) ** 2).mean())
+        out = model(X_test)
+        pred = X_test[:, :3] + out if PREDICT_DELTA else out
+        return float(((pred - Y_test) ** 2).mean())
 
 
 def run_prediction_experiment():
@@ -263,6 +280,17 @@ def run_prediction_experiment():
         print(f"{n:>8} {m:>12.6f} {sd:>12.6f}   {identity_mse / m:>11.1f}x")
     print("-" * 52)
     print(f"Best/worst MSE ratio across sample sizes: {max(means) / min(means):.1f}x")
+    label = "delta" if PREDICT_DELTA else "direct"
+    with open(f"results_prediction_{label}.json", "w") as f:
+        json.dump({
+            "parameterisation": label,
+            "sample_sizes": SAMPLE_SIZES,
+            "means": means, "stds": stds,
+            "identity_mse": identity_mse,
+            "n_seeds": N_SEEDS, "test_size": TEST_SIZE,
+        }, f, indent=2)
+    print(f"Saved results to results_prediction_{label}.json")
+
     print(f"\nPrediction experiment runtime: {(time.time() - t_start) / 60:.1f} min")
     return means, stds
 
