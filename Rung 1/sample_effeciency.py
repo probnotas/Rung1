@@ -160,7 +160,8 @@ def get_eval_seeds(n_eval=None, master_seed=MASTER_SEED):
     return np.random.default_rng(master_seed).integers(0, 2**31 - 1, size=n_eval)
 
 
-def evaluate(model, steps=None, n_eval=None, eval_seeds=None, action_fn=None):
+def evaluate(model, steps=None, n_eval=None, eval_seeds=None, action_fn=None,
+             env_fn=None):
     """Run the control test n_eval times and return (mean, std, per_run_costs).
 
     Each run starts from a fresh env.reset(). Passing the same eval_seeds to
@@ -170,8 +171,13 @@ def evaluate(model, steps=None, n_eval=None, eval_seeds=None, action_fn=None):
     action_fn(model, state) -> action selects the action; it defaults to the
     CEM planner. Passing a different policy (e.g. a trained SAC agent) reuses
     this exact evaluation loop, so baselines are scored identically.
+
+    env_fn() -> env builds the environment; it defaults to a stock Pendulum-v1.
+    Passing a factory (e.g. one with altered physics) scores a model on a
+    different body through this same loop.
     """
     action_fn = choose_action if action_fn is None else action_fn
+    env_fn = (lambda: gym.make("Pendulum-v1")) if env_fn is None else env_fn
     # Read config at call time, and let eval_seeds decide the count when given,
     # so the seed array and the loop can never disagree.
     steps = EVAL_STEPS if steps is None else steps
@@ -179,7 +185,7 @@ def evaluate(model, steps=None, n_eval=None, eval_seeds=None, action_fn=None):
         n_eval = N_EVAL if eval_seeds is None else len(eval_seeds)
     if eval_seeds is not None and len(eval_seeds) != n_eval:
         raise ValueError(f"eval_seeds has {len(eval_seeds)} entries, need {n_eval}")
-    env = gym.make("Pendulum-v1")
+    env = env_fn()
     run_costs = []
     for i in range(n_eval):
         if eval_seeds is not None:
